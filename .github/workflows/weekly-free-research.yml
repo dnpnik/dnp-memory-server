@@ -23,5 +23,6 @@ jobs:
 
       - name: Run free research script
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          API_BASE_URL: https://dnp-memory-server.onrender.com/api
+          MEMORY_API_KEY: ${{ secrets.MEMORY_API_KEY }}
         run: python cron_free_research.py

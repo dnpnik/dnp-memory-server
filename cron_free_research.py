@@ -1,14 +1,14 @@
 import os
+import json
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
-import psycopg2
-import psycopg2.extras
 
+API_BASE_URL = os.getenv("API_BASE_URL", "https://dnp-memory-server.onrender.com/api")
+MEMORY_API_KEY = os.getenv("MEMORY_API_KEY")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 TOPICS = [
     "догазификация согласие основного абонента судебная практика",
@@ -19,72 +19,9 @@ TOPICS = [
 ]
 
 
-def normalize_database_url(url: str) -> str:
-    if url and url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql://", 1)
-    return url
-
-
-def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
-
-    return psycopg2.connect(
-        normalize_database_url(DATABASE_URL),
-        cursor_factory=psycopg2.extras.RealDictCursor
-    )
-
-
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS memories (
-        id SERIAL PRIMARY KEY,
-        title TEXT NOT NULL,
-        content TEXT NOT NULL,
-        project TEXT,
-        tags TEXT,
-        importance TEXT DEFAULT 'normal',
-        type TEXT DEFAULT 'memory',
-        created_at TIMESTAMP NOT NULL
-    )
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def save_memory(title: str, content: str):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO memories (title, content, project, tags, importance, type, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-    """, (
-        title,
-        content,
-        "legal_work",
-        "github_actions,free_research,dogazification,legal",
-        "normal",
-        "github_actions_research",
-        datetime.utcnow()
-    ))
-
-    row = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return row["id"]
-
-
 def google_news_rss_search(query: str, limit: int = 10):
     encoded_query = urllib.parse.quote_plus(query)
+
     url = (
         "https://news.google.com/rss/search?"
         f"q={encoded_query}&hl=ru&gl=RU&ceid=RU:ru"
@@ -101,32 +38,61 @@ def google_news_rss_search(query: str, limit: int = 10):
         data = response.read()
 
     root = ET.fromstring(data)
+    channel = root.find("channel")
 
     items = []
-    channel = root.find("channel")
 
     if channel is None:
         return items
 
     for item in channel.findall("item")[:limit]:
-        title = item.findtext("title", default="")
-        link = item.findtext("link", default="")
-        pub_date = item.findtext("pubDate", default="")
-        description = item.findtext("description", default="")
-
         items.append({
-            "title": title,
-            "link": link,
-            "pub_date": pub_date,
-            "description": description
+            "title": item.findtext("title", default=""),
+            "link": item.findtext("link", default=""),
+            "pub_date": item.findtext("pubDate", default=""),
+            "description": item.findtext("description", default="")
         })
 
     return items
 
 
-def run():
-    init_db()
+def save_memory_via_api(title: str, content: str):
+    if not MEMORY_API_KEY:
+        raise RuntimeError("MEMORY_API_KEY is not set")
 
+    url = f"{API_BASE_URL}/memory/save"
+
+    payload = {
+        "title": title,
+        "content": content,
+        "project": "legal_work",
+        "tags": [
+            "github_actions",
+            "free_research",
+            "dogazification",
+            "legal"
+        ],
+        "importance": "normal"
+    }
+
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-API-Key": MEMORY_API_KEY
+        }
+    )
+
+    with urllib.request.urlopen(request, timeout=60) as response:
+        response_body = response.read().decode("utf-8")
+        return response.status, response_body
+
+
+def run():
     total_saved = 0
 
     for topic in TOPICS:
@@ -143,7 +109,7 @@ def run():
             continue
 
         parts = []
-        parts.append(f"АВТОПОИСК GITHUB ACTIONS")
+        parts.append("АВТОПОИСК GITHUB ACTIONS")
         parts.append(f"Тема: {topic}")
         parts.append(f"Дата поиска UTC: {datetime.utcnow().isoformat()}")
         parts.append("")
@@ -159,17 +125,19 @@ def run():
         parts.append("")
         parts.append("ВНИМАНИЕ:")
         parts.append(
-            "Запись создана автоматически бесплатным поиском через RSS. "
+            "Запись создана автоматически бесплатным поиском через GitHub Actions и RSS. "
             "Перед использованием в суде обязательно проверить источник, дату, текст судебного акта или нормативного документа."
         )
 
-        memory_id = save_memory(
-            title=f"Автопоиск GitHub Actions: {topic}",
-            content="\n".join(parts)
-        )
+        title = f"Автопоиск GitHub Actions: {topic}"
+        content = "\n".join(parts)
 
-        print(f"Saved memory id: {memory_id}")
-        total_saved += 1
+        try:
+            status, response_body = save_memory_via_api(title, content)
+            print(f"Saved via API. Status: {status}. Response: {response_body}")
+            total_saved += 1
+        except Exception as e:
+            print(f"Save failed for {topic}: {e}")
 
     print(f"Done. Total saved: {total_saved}")
 
