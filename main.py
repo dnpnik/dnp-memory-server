@@ -18,7 +18,7 @@ from pypdf import PdfReader
 
 app = FastAPI(
     title="DNP Self Learning Memory API",
-    version="1.2.2",
+    version="1.2.3",
     description="External PostgreSQL memory server with Google Drive search/read endpoints for Custom GPT Actions."
 )
 
@@ -163,11 +163,12 @@ def limit_text(text: str, max_chars: int = 120000) -> str:
 def download_drive_file_to_bytes(service, file_id: str) -> bytes:
     """
     Downloads binary file content from Google Drive into bytes.
+
+    Important:
+    No metadata request and no supportsAllDrives parameter here.
+    This avoids HttpError 400 on some Drive API configurations.
     """
-    request = service.files().get_media(
-        fileId=file_id,
-        supportsAllDrives=True
-    )
+    request = service.files().get_media(fileId=file_id)
 
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
@@ -182,6 +183,7 @@ def download_drive_file_to_bytes(service, file_id: str) -> bytes:
 def export_google_file_to_bytes(service, file_id: str, export_mime_type: str) -> bytes:
     """
     Exports Google Docs/Sheets/Slides to bytes.
+    Kept for future use, but /drive/read currently avoids metadata calls.
     """
     request = service.files().export_media(
         fileId=file_id,
@@ -592,9 +594,7 @@ def search_drive_files(
         response = service.files().list(
             q=drive_query,
             pageSize=max(1, min(limit, 50)),
-            fields="files(id,name,mimeType,webViewLink,modifiedTime,size)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
+            fields="files(id,name,mimeType,webViewLink,modifiedTime,size)"
         ).execute()
 
         files = response.get("files", [])
@@ -627,72 +627,46 @@ def search_drive_files(
 def read_drive_file(
     file_id: str = Query(..., description="Google Drive file ID"),
     max_chars: int = Query(120000, description="Maximum extracted text characters"),
+    name: Optional[str] = Query(None, description="Optional file name from search result"),
+    mime_type: Optional[str] = Query(None, description="Optional mime type from search result"),
     x_api_key: Optional[str] = Header(None),
 ):
     """
     Reads text from a Google Drive file by file_id.
 
-    Supported:
-    - Google Docs
-    - Google Sheets
-    - Google Slides
-    - text/plain
-    - text/html
-    - text/csv
-    - application/json
-    - application/xml
-    - text/xml
-    - text/markdown
-    - PDF via pypdf
+    Important:
+    This version does NOT call files().get metadata because some Drive API
+    configurations return HttpError 400 on metadata fields.
+    It downloads the file directly and tries to extract text.
+
+    Recommended:
+    Pass name and mime_type from searchDriveFiles result.
+    Example:
+    /drive/read?file_id=...&name=file.pdf&mime_type=application/pdf
     """
     check_api_key(x_api_key)
 
     try:
         service = get_drive_service()
 
-        # Very safe metadata request.
-        # Some Google Drive API configurations reject extra fields in files.get.
-        metadata = service.files().get(
-            fileId=file_id,
-            fields="id,name,mimeType",
-            supportsAllDrives=True
-        ).execute()
+        file_name = name or ""
+        file_mime_type = mime_type or ""
 
-        mime_type = metadata.get("mimeType")
-        name = metadata.get("name") or ""
+        raw_bytes = download_drive_file_to_bytes(service, file_id)
 
         text = ""
 
-        # Google Docs
-        if mime_type == "application/vnd.google-apps.document":
-            raw_bytes = export_google_file_to_bytes(
-                service,
-                file_id,
-                "text/plain"
-            )
-            text = raw_bytes.decode("utf-8", errors="replace")
+        # PDF files or unknown binary that starts as PDF
+        if (
+            file_mime_type == "application/pdf"
+            or file_name.lower().endswith(".pdf")
+            or raw_bytes[:4] == b"%PDF"
+        ):
+            text = extract_pdf_text(raw_bytes)
 
-        # Google Sheets
-        elif mime_type == "application/vnd.google-apps.spreadsheet":
-            raw_bytes = export_google_file_to_bytes(
-                service,
-                file_id,
-                "text/csv"
-            )
-            text = raw_bytes.decode("utf-8", errors="replace")
-
-        # Google Slides
-        elif mime_type == "application/vnd.google-apps.presentation":
-            raw_bytes = export_google_file_to_bytes(
-                service,
-                file_id,
-                "text/plain"
-            )
-            text = raw_bytes.decode("utf-8", errors="replace")
-
-        # Plain text-like files
+        # Text-like files
         elif (
-            mime_type in [
+            file_mime_type in [
                 "text/plain",
                 "text/html",
                 "text/csv",
@@ -701,7 +675,7 @@ def read_drive_file(
                 "text/xml",
                 "text/markdown"
             ]
-            or name.lower().endswith((
+            or file_name.lower().endswith((
                 ".txt",
                 ".md",
                 ".csv",
@@ -711,36 +685,26 @@ def read_drive_file(
                 ".htm"
             ))
         ):
-            raw_bytes = download_drive_file_to_bytes(service, file_id)
             text = raw_bytes.decode("utf-8", errors="replace")
 
-        # PDF files
-        elif mime_type == "application/pdf" or name.lower().endswith(".pdf"):
-            pdf_bytes = download_drive_file_to_bytes(service, file_id)
-            text = extract_pdf_text(pdf_bytes)
-
-        # DOCX placeholder
-        elif name.lower().endswith(".docx"):
-            text = (
-                "DOCX file detected. This endpoint found the DOCX metadata, "
-                "but DOCX text extraction is not enabled in this version. "
-                "Add python-docx if DOCX reading is needed."
-            )
-
+        # Fallback: try UTF-8 decode
         else:
-            text = (
-                f"Unsupported or binary file type for direct text extraction: {mime_type}. "
-                "The file was found, but text could not be extracted by this endpoint."
-            )
+            try:
+                text = raw_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                text = (
+                    "File was downloaded, but direct text extraction is not supported "
+                    "for this file type. For DOCX add python-docx; for scanned PDF add OCR."
+                )
 
         return {
             "ok": True,
-            "file_id": metadata.get("id"),
-            "name": name,
-            "mimeType": mime_type,
+            "file_id": file_id,
+            "name": file_name,
+            "mimeType": file_mime_type,
             "webViewLink": f"https://drive.google.com/file/d/{file_id}/view",
             "modifiedTime": None,
-            "size": None,
+            "size": len(raw_bytes),
             "text": limit_text(text, max_chars=max_chars)
         }
 
