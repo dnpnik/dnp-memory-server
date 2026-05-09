@@ -1,23 +1,41 @@
+import io
 import os
-import psycopg2
-import psycopg2.extras
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 
 app = FastAPI(
     title="DNP Self Learning Memory API",
-    version="1.0.0",
-    description="External PostgreSQL memory server for Custom GPT Actions."
+    version="1.1.0",
+    description="External PostgreSQL memory server with Google Drive search/read endpoints for Custom GPT Actions."
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 API_KEY = os.getenv("MEMORY_API_KEY", "change-me")
 
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv(
+    "GOOGLE_SERVICE_ACCOUNT_FILE",
+    "service_account.json"
+)
+
+GOOGLE_DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly"
+]
+
+
+# =========================
+# COMMON HELPERS
+# =========================
 
 def normalize_database_url(url: str) -> str:
     """
@@ -99,10 +117,58 @@ def init_db():
     conn.close()
 
 
+def get_drive_service():
+    """
+    Creates Google Drive API service using service_account.json.
+    On Render, recommended path:
+    GOOGLE_SERVICE_ACCOUNT_FILE=/etc/secrets/service_account.json
+    """
+    if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Google service account file not found: {GOOGLE_SERVICE_ACCOUNT_FILE}"
+        )
+
+    credentials = service_account.Credentials.from_service_account_file(
+        GOOGLE_SERVICE_ACCOUNT_FILE,
+        scopes=GOOGLE_DRIVE_SCOPES
+    )
+
+    return build("drive", "v3", credentials=credentials)
+
+
+def escape_drive_query(value: str) -> str:
+    """
+    Escapes single quotes for Google Drive query syntax.
+    """
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def limit_text(text: str, max_chars: int = 120000) -> str:
+    """
+    Limits extracted text so GPT Action response is not too huge.
+    """
+    if not text:
+        return ""
+
+    if len(text) <= max_chars:
+        return text
+
+    return text[:max_chars] + "\n\n...[TEXT TRUNCATED]..."
+
+
+# =========================
+# STARTUP
+# =========================
+
 @app.on_event("startup")
 def startup_event():
     init_db()
 
+
+# =========================
+# MODELS
+# =========================
 
 class SearchRequest(BaseModel):
     query: str
@@ -134,19 +200,26 @@ class CaseNoteSaveRequest(BaseModel):
     tags: Optional[List[str]] = []
 
 
+# =========================
+# BASIC ROUTES
+# =========================
+
 @app.get("/")
 def root():
     return {
+        "ok": True,
         "status": "ok",
-        "message": "DNP Memory Server with PostgreSQL is running"
+        "message": "DNP Memory Server with PostgreSQL and Google Drive is running"
     }
 
 
 @app.get("/health")
 def health():
     return {
+        "ok": True,
         "status": "ok",
-        "database": "postgresql"
+        "database": "postgresql",
+        "drive": "google_drive_readonly"
     }
 
 
@@ -187,11 +260,17 @@ def privacy_policy():
     """
 
 
+# =========================
+# MEMORY ROUTES
+# =========================
+
 @app.post("/api/memory/search")
 def search_memory(request: SearchRequest, x_api_key: Optional[str] = Header(None)):
     check_api_key(x_api_key)
 
     query_like = f"%{request.query}%"
+    limit = max(1, min(request.limit, 50))
+
     conn = get_conn()
     cur = conn.cursor()
 
@@ -208,7 +287,7 @@ def search_memory(request: SearchRequest, x_api_key: Optional[str] = Header(None
             query_like,
             query_like,
             query_like,
-            request.limit
+            limit
         ))
     else:
         cur.execute("""
@@ -221,7 +300,7 @@ def search_memory(request: SearchRequest, x_api_key: Optional[str] = Header(None
             query_like,
             query_like,
             query_like,
-            request.limit
+            limit
         ))
 
     rows = cur.fetchall()
@@ -243,6 +322,8 @@ def search_memory(request: SearchRequest, x_api_key: Optional[str] = Header(None
         })
 
     return {
+        "ok": True,
+        "count": len(results),
         "results": results
     }
 
@@ -278,8 +359,14 @@ def save_memory(request: MemorySaveRequest, x_api_key: Optional[str] = Header(No
     conn.close()
 
     return {
+        "ok": True,
         "saved": True,
-        "id": str(row["id"])
+        "id": str(row["id"]),
+        "title": request.title,
+        "project": request.project,
+        "tags": request.tags or [],
+        "importance": request.importance,
+        "created_at": created_at.isoformat()
     }
 
 
@@ -336,6 +423,7 @@ def save_feedback(request: FeedbackSaveRequest, x_api_key: Optional[str] = Heade
     conn.close()
 
     return {
+        "ok": True,
         "saved": True,
         "id": str(feedback_row["id"])
     }
@@ -388,6 +476,209 @@ def save_case_note(request: CaseNoteSaveRequest, x_api_key: Optional[str] = Head
     conn.close()
 
     return {
+        "ok": True,
         "saved": True,
         "id": str(case_row["id"])
     }
+
+
+# =========================
+# GOOGLE DRIVE ROUTES
+# =========================
+
+@app.get("/drive/search")
+def search_drive_files(
+    q: str = Query(..., description="Search query, file name, phrase, or keyword"),
+    folder_id: Optional[str] = Query(None, description="Optional Google Drive folder ID"),
+    limit: int = Query(10, description="Maximum number of files to return"),
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    Searches Google Drive by file name or indexed full text.
+    Requires service account access to target folders/files.
+    """
+    check_api_key(x_api_key)
+
+    try:
+        service = get_drive_service()
+
+        safe_query = escape_drive_query(q)
+
+        query_parts = [
+            "trashed = false",
+            f"(name contains '{safe_query}' or fullText contains '{safe_query}')"
+        ]
+
+        if folder_id:
+            safe_folder_id = escape_drive_query(folder_id)
+            query_parts.append(f"'{safe_folder_id}' in parents")
+
+        drive_query = " and ".join(query_parts)
+
+        response = service.files().list(
+            q=drive_query,
+            pageSize=max(1, min(limit, 50)),
+            fields="files(id, name, mimeType, webViewLink, modifiedTime, size)"
+        ).execute()
+
+        files = response.get("files", [])
+
+        return {
+            "ok": True,
+            "query": q,
+            "folder_id": folder_id,
+            "count": len(files),
+            "files": [
+                {
+                    "file_id": item.get("id"),
+                    "name": item.get("name"),
+                    "mimeType": item.get("mimeType"),
+                    "webViewLink": item.get("webViewLink"),
+                    "modifiedTime": item.get("modifiedTime"),
+                    "size": item.get("size")
+                }
+                for item in files
+            ]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/drive/read")
+def read_drive_file(
+    file_id: str = Query(..., description="Google Drive file ID"),
+    max_chars: int = Query(120000, description="Maximum extracted text characters"),
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    Reads text from a Google Drive file by file_id.
+
+    Supported best:
+    - Google Docs
+    - text/plain
+    - text/html
+    - text/csv
+    - application/json
+    - markdown-like files
+    - PDF only as raw bytes placeholder unless extra PDF extraction library is added
+    """
+    check_api_key(x_api_key)
+
+    try:
+        service = get_drive_service()
+
+        metadata = service.files().get(
+            fileId=file_id,
+            fields="id, name, mimeType, webViewLink, modifiedTime, size"
+        ).execute()
+
+        mime_type = metadata.get("mimeType")
+        name = metadata.get("name")
+
+        text = ""
+
+        # Google Docs
+        if mime_type == "application/vnd.google-apps.document":
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType="text/plain"
+            )
+            buffer = io.BytesIO()
+            downloader = MediaIoBaseDownload(buffer, request)
+
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+            text = buffer.getvalue().decode("utf-8", errors="replace")
+
+        # Google Sheets
+        elif mime_type == "application/vnd.google-apps.spreadsheet":
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType="text/csv"
+            )
+            buffer = io.BytesIO()
+            downloader = MediaIoBaseDownload(buffer, request)
+
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+            text = buffer.getvalue().decode("utf-8", errors="replace")
+
+        # Google Slides
+        elif mime_type == "application/vnd.google-apps.presentation":
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType="text/plain"
+            )
+            buffer = io.BytesIO()
+            downloader = MediaIoBaseDownload(buffer, request)
+
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+            text = buffer.getvalue().decode("utf-8", errors="replace")
+
+        # Plain text-like files
+        elif mime_type in [
+            "text/plain",
+            "text/html",
+            "text/csv",
+            "application/json",
+            "application/xml",
+            "text/xml",
+            "text/markdown"
+        ] or (name and name.lower().endswith((".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm"))):
+            request = service.files().get_media(fileId=file_id)
+            buffer = io.BytesIO()
+            downloader = MediaIoBaseDownload(buffer, request)
+
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+            text = buffer.getvalue().decode("utf-8", errors="replace")
+
+        # PDF placeholder
+        elif mime_type == "application/pdf" or (name and name.lower().endswith(".pdf")):
+            text = (
+                "PDF file detected. This endpoint currently found the PDF metadata, "
+                "but text extraction from PDF is not enabled in this version. "
+                "Add pypdf/pdfplumber or OCR pipeline if scanned PDF reading is needed."
+            )
+
+        # DOCX placeholder
+        elif name and name.lower().endswith(".docx"):
+            text = (
+                "DOCX file detected. This endpoint currently found the DOCX metadata, "
+                "but DOCX text extraction is not enabled in this version. "
+                "Add python-docx if DOCX reading is needed."
+            )
+
+        else:
+            text = (
+                f"Unsupported or binary file type for direct text extraction: {mime_type}. "
+                "The file was found, but text could not be extracted by this endpoint."
+            )
+
+        return {
+            "ok": True,
+            "file_id": metadata.get("id"),
+            "name": name,
+            "mimeType": mime_type,
+            "webViewLink": metadata.get("webViewLink"),
+            "modifiedTime": metadata.get("modifiedTime"),
+            "size": metadata.get("size"),
+            "text": limit_text(text, max_chars=max_chars)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
