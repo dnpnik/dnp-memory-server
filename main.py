@@ -12,13 +12,14 @@ from pydantic import BaseModel
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from google.auth.transport.requests import AuthorizedSession
 
 from pypdf import PdfReader
 
 
 app = FastAPI(
     title="DNP Self Learning Memory API",
-    version="1.2.3",
+    version="1.2.4",
     description="External PostgreSQL memory server with Google Drive search/read endpoints for Custom GPT Actions."
 )
 
@@ -160,30 +161,62 @@ def limit_text(text: str, max_chars: int = 120000) -> str:
     return text[:max_chars] + "\n\n...[TEXT TRUNCATED]..."
 
 
-def download_drive_file_to_bytes(service, file_id: str) -> bytes:
+def download_drive_file_to_bytes(
+    service,
+    file_id: str,
+    download_url: Optional[str] = None
+) -> bytes:
     """
     Downloads binary file content from Google Drive into bytes.
 
-    Important:
-    No metadata request and no supportsAllDrives parameter here.
-    This avoids HttpError 400 on some Drive API configurations.
+    Strategy:
+    1. First tries Drive API get_media.
+    2. If get_media fails and download_url is provided, tries authorized webContentLink download.
     """
-    request = service.files().get_media(fileId=file_id)
+    try:
+        request = service.files().get_media(fileId=file_id)
 
-    buffer = io.BytesIO()
-    downloader = MediaIoBaseDownload(buffer, request)
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
 
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
 
-    return buffer.getvalue()
+        return buffer.getvalue()
+
+    except Exception as api_error:
+        if not download_url:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Drive get_media failed and no download_url provided: {api_error}"
+            )
+
+        try:
+            # googleapiclient service created by build() usually keeps authorized http here
+            credentials = service._http.credentials
+            session = AuthorizedSession(credentials)
+
+            response = session.get(download_url)
+            response.raise_for_status()
+
+            return response.content
+
+        except Exception as link_error:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Drive download failed. "
+                    f"get_media error: {api_error}; "
+                    f"webContentLink error: {link_error}"
+                )
+            )
 
 
 def export_google_file_to_bytes(service, file_id: str, export_mime_type: str) -> bytes:
     """
     Exports Google Docs/Sheets/Slides to bytes.
-    Kept for future use, but /drive/read currently avoids metadata calls.
+    Kept for future use.
     """
     request = service.files().export_media(
         fileId=file_id,
@@ -594,7 +627,7 @@ def search_drive_files(
         response = service.files().list(
             q=drive_query,
             pageSize=max(1, min(limit, 50)),
-            fields="files(id,name,mimeType,webViewLink,modifiedTime,size)"
+            fields="files(id,name,mimeType,webViewLink,webContentLink,modifiedTime,size)"
         ).execute()
 
         files = response.get("files", [])
@@ -610,6 +643,7 @@ def search_drive_files(
                     "name": item.get("name"),
                     "mimeType": item.get("mimeType"),
                     "webViewLink": item.get("webViewLink") or f"https://drive.google.com/file/d/{item.get('id')}/view",
+                    "downloadUrl": item.get("webContentLink"),
                     "modifiedTime": item.get("modifiedTime"),
                     "size": item.get("size")
                 }
@@ -629,6 +663,7 @@ def read_drive_file(
     max_chars: int = Query(120000, description="Maximum extracted text characters"),
     name: Optional[str] = Query(None, description="Optional file name from search result"),
     mime_type: Optional[str] = Query(None, description="Optional mime type from search result"),
+    download_url: Optional[str] = Query(None, description="Optional webContentLink from search result"),
     x_api_key: Optional[str] = Header(None),
 ):
     """
@@ -637,12 +672,10 @@ def read_drive_file(
     Important:
     This version does NOT call files().get metadata because some Drive API
     configurations return HttpError 400 on metadata fields.
-    It downloads the file directly and tries to extract text.
 
-    Recommended:
-    Pass name and mime_type from searchDriveFiles result.
-    Example:
-    /drive/read?file_id=...&name=file.pdf&mime_type=application/pdf
+    Strategy:
+    1. Try Drive API get_media.
+    2. If it fails, try authorized download_url / webContentLink.
     """
     check_api_key(x_api_key)
 
@@ -652,7 +685,11 @@ def read_drive_file(
         file_name = name or ""
         file_mime_type = mime_type or ""
 
-        raw_bytes = download_drive_file_to_bytes(service, file_id)
+        raw_bytes = download_drive_file_to_bytes(
+            service,
+            file_id,
+            download_url=download_url
+        )
 
         text = ""
 
@@ -703,6 +740,7 @@ def read_drive_file(
             "name": file_name,
             "mimeType": file_mime_type,
             "webViewLink": f"https://drive.google.com/file/d/{file_id}/view",
+            "downloadUrlUsed": bool(download_url),
             "modifiedTime": None,
             "size": len(raw_bytes),
             "text": limit_text(text, max_chars=max_chars)
