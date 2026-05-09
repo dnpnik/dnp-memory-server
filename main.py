@@ -13,10 +13,12 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
+from pypdf import PdfReader
+
 
 app = FastAPI(
     title="DNP Self Learning Memory API",
-    version="1.1.0",
+    version="1.2.0",
     description="External PostgreSQL memory server with Google Drive search/read endpoints for Custom GPT Actions."
 )
 
@@ -62,7 +64,7 @@ def get_conn():
 
 def check_api_key(x_api_key: Optional[str]):
     """
-    Checks X-API-Key header from GPT Action request.
+    Checks x-api-key header from GPT Action request.
     """
     if not x_api_key or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -120,7 +122,8 @@ def init_db():
 def get_drive_service():
     """
     Creates Google Drive API service using service_account.json.
-    On Render, recommended path:
+
+    On Render recommended:
     GOOGLE_SERVICE_ACCOUNT_FILE=/etc/secrets/service_account.json
     """
     if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
@@ -139,7 +142,7 @@ def get_drive_service():
 
 def escape_drive_query(value: str) -> str:
     """
-    Escapes single quotes for Google Drive query syntax.
+    Escapes single quotes and backslashes for Google Drive query syntax.
     """
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
@@ -155,6 +158,72 @@ def limit_text(text: str, max_chars: int = 120000) -> str:
         return text
 
     return text[:max_chars] + "\n\n...[TEXT TRUNCATED]..."
+
+
+def download_drive_file_to_bytes(service, file_id: str) -> bytes:
+    """
+    Downloads binary file content from Google Drive into bytes.
+    """
+    request = service.files().get_media(fileId=file_id)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    return buffer.getvalue()
+
+
+def export_google_file_to_bytes(service, file_id: str, export_mime_type: str) -> bytes:
+    """
+    Exports Google Docs/Sheets/Slides to bytes.
+    """
+    request = service.files().export_media(
+        fileId=file_id,
+        mimeType=export_mime_type
+    )
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    return buffer.getvalue()
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    """
+    Extracts text from PDF using pypdf.
+    Works for text PDFs.
+    For scanned PDFs, OCR is needed separately.
+    """
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages_text = []
+
+        for index, page in enumerate(reader.pages, start=1):
+            try:
+                page_text = page.extract_text() or ""
+            except Exception as page_error:
+                page_text = f"[Page {index}: text extraction error: {page_error}]"
+
+            if page_text.strip():
+                pages_text.append(f"\n\n--- PAGE {index} ---\n{page_text}")
+
+        extracted = "\n".join(pages_text).strip()
+
+        if not extracted:
+            return (
+                "PDF file was downloaded, but no text was extracted. "
+                "Most likely this is a scanned/image PDF and OCR is required."
+            )
+
+        return extracted
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF text extraction error: {e}")
 
 
 # =========================
@@ -518,7 +587,7 @@ def search_drive_files(
         response = service.files().list(
             q=drive_query,
             pageSize=max(1, min(limit, 50)),
-            fields="files(id, name, mimeType, webViewLink, modifiedTime, size)"
+            fields="files(id,name,mimeType,webViewLink,modifiedTime,size)"
         ).execute()
 
         files = response.get("files", [])
@@ -556,14 +625,18 @@ def read_drive_file(
     """
     Reads text from a Google Drive file by file_id.
 
-    Supported best:
+    Supported:
     - Google Docs
+    - Google Sheets
+    - Google Slides
     - text/plain
     - text/html
     - text/csv
     - application/json
-    - markdown-like files
-    - PDF only as raw bytes placeholder unless extra PDF extraction library is added
+    - application/xml
+    - text/xml
+    - text/markdown
+    - PDF via pypdf
     """
     check_api_key(x_api_key)
 
@@ -572,91 +645,74 @@ def read_drive_file(
 
         metadata = service.files().get(
             fileId=file_id,
-            fields="id, name, mimeType, webViewLink, modifiedTime, size"
+            fields="id,name,mimeType,webViewLink,modifiedTime,size"
         ).execute()
 
         mime_type = metadata.get("mimeType")
-        name = metadata.get("name")
+        name = metadata.get("name") or ""
 
         text = ""
 
         # Google Docs
         if mime_type == "application/vnd.google-apps.document":
-            request = service.files().export_media(
-                fileId=file_id,
-                mimeType="text/plain"
+            raw_bytes = export_google_file_to_bytes(
+                service,
+                file_id,
+                "text/plain"
             )
-            buffer = io.BytesIO()
-            downloader = MediaIoBaseDownload(buffer, request)
-
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-
-            text = buffer.getvalue().decode("utf-8", errors="replace")
+            text = raw_bytes.decode("utf-8", errors="replace")
 
         # Google Sheets
         elif mime_type == "application/vnd.google-apps.spreadsheet":
-            request = service.files().export_media(
-                fileId=file_id,
-                mimeType="text/csv"
+            raw_bytes = export_google_file_to_bytes(
+                service,
+                file_id,
+                "text/csv"
             )
-            buffer = io.BytesIO()
-            downloader = MediaIoBaseDownload(buffer, request)
-
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-
-            text = buffer.getvalue().decode("utf-8", errors="replace")
+            text = raw_bytes.decode("utf-8", errors="replace")
 
         # Google Slides
         elif mime_type == "application/vnd.google-apps.presentation":
-            request = service.files().export_media(
-                fileId=file_id,
-                mimeType="text/plain"
+            raw_bytes = export_google_file_to_bytes(
+                service,
+                file_id,
+                "text/plain"
             )
-            buffer = io.BytesIO()
-            downloader = MediaIoBaseDownload(buffer, request)
-
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-
-            text = buffer.getvalue().decode("utf-8", errors="replace")
+            text = raw_bytes.decode("utf-8", errors="replace")
 
         # Plain text-like files
-        elif mime_type in [
-            "text/plain",
-            "text/html",
-            "text/csv",
-            "application/json",
-            "application/xml",
-            "text/xml",
-            "text/markdown"
-        ] or (name and name.lower().endswith((".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm"))):
-            request = service.files().get_media(fileId=file_id)
-            buffer = io.BytesIO()
-            downloader = MediaIoBaseDownload(buffer, request)
+        elif (
+            mime_type in [
+                "text/plain",
+                "text/html",
+                "text/csv",
+                "application/json",
+                "application/xml",
+                "text/xml",
+                "text/markdown"
+            ]
+            or name.lower().endswith((
+                ".txt",
+                ".md",
+                ".csv",
+                ".json",
+                ".xml",
+                ".html",
+                ".htm"
+            ))
+        ):
+            raw_bytes = download_drive_file_to_bytes(service, file_id)
+            text = raw_bytes.decode("utf-8", errors="replace")
 
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-
-            text = buffer.getvalue().decode("utf-8", errors="replace")
-
-        # PDF placeholder
-        elif mime_type == "application/pdf" or (name and name.lower().endswith(".pdf")):
-            text = (
-                "PDF file detected. This endpoint currently found the PDF metadata, "
-                "but text extraction from PDF is not enabled in this version. "
-                "Add pypdf/pdfplumber or OCR pipeline if scanned PDF reading is needed."
-            )
+        # PDF files
+        elif mime_type == "application/pdf" or name.lower().endswith(".pdf"):
+            pdf_bytes = download_drive_file_to_bytes(service, file_id)
+            text = extract_pdf_text(pdf_bytes)
 
         # DOCX placeholder
-        elif name and name.lower().endswith(".docx"):
+        elif name.lower().endswith(".docx"):
             text = (
-                "DOCX file detected. This endpoint currently found the DOCX metadata, "
+                "DOCX file detected. This endpoint found the DOCX metadata, "
                 "but DOCX text extraction is not enabled in this version. "
                 "Add python-docx if DOCX reading is needed."
             )
