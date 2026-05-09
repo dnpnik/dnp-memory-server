@@ -18,7 +18,7 @@ from pypdf import PdfReader
 
 app = FastAPI(
     title="DNP Self Learning Memory API",
-    version="1.2.1",
+    version="1.2.2",
     description="External PostgreSQL memory server with Google Drive search/read endpoints for Custom GPT Actions."
 )
 
@@ -164,7 +164,11 @@ def download_drive_file_to_bytes(service, file_id: str) -> bytes:
     """
     Downloads binary file content from Google Drive into bytes.
     """
-    request = service.files().get_media(fileId=file_id)
+    request = service.files().get_media(
+        fileId=file_id,
+        supportsAllDrives=True
+    )
+
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
 
@@ -183,6 +187,7 @@ def export_google_file_to_bytes(service, file_id: str, export_mime_type: str) ->
         fileId=file_id,
         mimeType=export_mime_type
     )
+
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
 
@@ -587,7 +592,9 @@ def search_drive_files(
         response = service.files().list(
             q=drive_query,
             pageSize=max(1, min(limit, 50)),
-            fields="files(id,name,mimeType,webViewLink,modifiedTime,size)"
+            fields="files(id,name,mimeType,webViewLink,modifiedTime,size)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
 
         files = response.get("files", [])
@@ -643,12 +650,12 @@ def read_drive_file(
     try:
         service = get_drive_service()
 
-        # IMPORTANT:
-        # Some Drive API accounts reject webViewLink/size in files.get fields.
-        # Keep metadata fields minimal and build webViewLink manually.
+        # Very safe metadata request.
+        # Some Google Drive API configurations reject extra fields in files.get.
         metadata = service.files().get(
             fileId=file_id,
-            fields="id,name,mimeType,modifiedTime"
+            fields="id,name,mimeType",
+            supportsAllDrives=True
         ).execute()
 
         mime_type = metadata.get("mimeType")
@@ -732,7 +739,7 @@ def read_drive_file(
             "name": name,
             "mimeType": mime_type,
             "webViewLink": f"https://drive.google.com/file/d/{file_id}/view",
-            "modifiedTime": metadata.get("modifiedTime"),
+            "modifiedTime": None,
             "size": None,
             "text": limit_text(text, max_chars=max_chars)
         }
