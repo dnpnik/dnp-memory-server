@@ -18,7 +18,7 @@ from pypdf import PdfReader
 
 app = FastAPI(
     title="DNP Self Learning Memory API",
-    version="1.2.0",
+    version="1.2.1",
     description="External PostgreSQL memory server with Google Drive search/read endpoints for Custom GPT Actions."
 )
 
@@ -602,7 +602,7 @@ def search_drive_files(
                     "file_id": item.get("id"),
                     "name": item.get("name"),
                     "mimeType": item.get("mimeType"),
-                    "webViewLink": item.get("webViewLink"),
+                    "webViewLink": item.get("webViewLink") or f"https://drive.google.com/file/d/{item.get('id')}/view",
                     "modifiedTime": item.get("modifiedTime"),
                     "size": item.get("size")
                 }
@@ -643,9 +643,12 @@ def read_drive_file(
     try:
         service = get_drive_service()
 
+        # IMPORTANT:
+        # Some Drive API accounts reject webViewLink/size in files.get fields.
+        # Keep metadata fields minimal and build webViewLink manually.
         metadata = service.files().get(
             fileId=file_id,
-            fields="id,name,mimeType,webViewLink,modifiedTime,size"
+            fields="id,name,mimeType,modifiedTime"
         ).execute()
 
         mime_type = metadata.get("mimeType")
@@ -728,9 +731,9 @@ def read_drive_file(
             "file_id": metadata.get("id"),
             "name": name,
             "mimeType": mime_type,
-            "webViewLink": metadata.get("webViewLink"),
+            "webViewLink": f"https://drive.google.com/file/d/{file_id}/view",
             "modifiedTime": metadata.get("modifiedTime"),
-            "size": metadata.get("size"),
+            "size": None,
             "text": limit_text(text, max_chars=max_chars)
         }
 
